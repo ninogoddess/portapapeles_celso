@@ -41,9 +41,22 @@ export default function App() {
     return () => supabase.removeChannel(channel)
   }, [])
 
-  // Agregar nota nueva
+  // Agregar nota nueva — optimista: aparece local de inmediato
   async function addNote() {
-    await supabase.from('notes').insert({ content: '' })
+    const { data, error } = await supabase
+      .from('notes')
+      .insert({ content: '' })
+      .select()
+      .single()
+    if (error) {
+      console.error('Error al insertar:', error)
+      return
+    }
+    // Si Realtime no la trae sola, la agregamos manualmente
+    setNotes((prev) => {
+      const yaExiste = prev.some((n) => n.id === data.id)
+      return yaExiste ? prev : [...prev, data]
+    })
   }
 
   // Editar con debounce: actualiza local inmediato, guarda en Supabase al dejar de escribir
