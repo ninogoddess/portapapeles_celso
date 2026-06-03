@@ -4,11 +4,12 @@ import { supabase } from './supabase'
 export default function App() {
   const [notes, setNotes] = useState([])
   const [loading, setLoading] = useState(true)
+  const [copiedId, setCopiedId] = useState(null)
+  const [deletingId, setDeletingId] = useState(null)
+  const [newIds, setNewIds] = useState(new Set())
   const debounceTimers = useRef({})
-  // IDs de notas que el usuario está editando activamente — ignoramos Realtime UPDATE para ellas
   const editingIds = useRef(new Set())
 
-  // Carga inicial
   useEffect(() => {
     async function fetchNotes() {
       const { data } = await supabase
@@ -20,7 +21,6 @@ export default function App() {
     }
     fetchNotes()
 
-    // Suscripción en tiempo real
     const channel = supabase
       .channel('notes-realtime')
       .on(
@@ -29,12 +29,19 @@ export default function App() {
         (payload) => {
           if (payload.eventType === 'INSERT') {
             setNotes((prev) => {
-              // Evitar duplicados
               if (prev.some((n) => n.id === payload.new.id)) return prev
               return [...prev, payload.new]
             })
+            // Marcar como nueva para animación de entrada
+            setNewIds((prev) => new Set(prev).add(payload.new.id))
+            setTimeout(() => {
+              setNewIds((prev) => {
+                const next = new Set(prev)
+                next.delete(payload.new.id)
+                return next
+              })
+            }, 500)
           } else if (payload.eventType === 'UPDATE') {
-            // Si el usuario está editando esta nota, no sobreescribir su texto
             if (editingIds.current.has(payload.new.id)) return
             setNotes((prev) =>
               prev.map((n) => (n.id === payload.new.id ? payload.new : n))
@@ -49,38 +56,35 @@ export default function App() {
     return () => supabase.removeChannel(channel)
   }, [])
 
-  // Agregar nota — solo Realtime la inserta en el estado, sin optimismo
   async function addNote() {
     const { error } = await supabase.from('notes').insert({ content: '' })
     if (error) console.error('Error al insertar:', error)
   }
 
-  // Editar con debounce
   function handleChange(id, value) {
-    // Marcar como "editando" para que Realtime no sobreescriba
     editingIds.current.add(id)
-
     setNotes((prev) =>
       prev.map((n) => (n.id === id ? { ...n, content: value } : n))
     )
-
     clearTimeout(debounceTimers.current[id])
     debounceTimers.current[id] = setTimeout(async () => {
       await supabase.from('notes').update({ content: value }).eq('id', id)
-      // Ya guardado, permitir updates de Realtime nuevamente
       editingIds.current.delete(id)
     }, 800)
   }
 
-  // Borrar nota
   async function deleteNote(id) {
     clearTimeout(debounceTimers.current[id])
     editingIds.current.delete(id)
-    await supabase.from('notes').delete().eq('id', id)
+    // Animar salida, luego borrar
+    setDeletingId(id)
+    setTimeout(async () => {
+      await supabase.from('notes').delete().eq('id', id)
+      setDeletingId(null)
+    }, 350)
   }
 
-  // Copiar al portapapeles del sistema
-  async function copyNote(content) {
+  async function copyNote(id, content) {
     try {
       await navigator.clipboard.writeText(content)
     } catch {
@@ -91,6 +95,8 @@ export default function App() {
       document.execCommand('copy')
       document.body.removeChild(el)
     }
+    setCopiedId(id)
+    setTimeout(() => setCopiedId(null), 1200)
   }
 
   if (loading) return <div className="center">Cargando...</div>
@@ -108,7 +114,14 @@ export default function App() {
 
       <div className="notes">
         {notes.map((note) => (
-          <div className="note" key={note.id}>
+          <div
+            className={[
+              'note',
+              newIds.has(note.id) ? 'note-enter' : '',
+              deletingId === note.id ? 'note-exit' : '',
+            ].join(' ').trim()}
+            key={note.id}
+          >
             <textarea
               value={note.content}
               onChange={(e) => handleChange(note.id, e.target.value)}
@@ -118,10 +131,14 @@ export default function App() {
             <div className="note-actions">
               <button
                 className="btn-copy"
-                onClick={() => copyNote(note.content)}
+                onClick={() => copyNote(note.id, note.content)}
                 title="Copiar"
               >
-                📄 Copiar
+                {copiedId === note.id ? (
+                  <span className="tick">✓ Copiado</span>
+                ) : (
+                  '📄 Copiar'
+                )}
               </button>
               <button
                 className="btn-delete"
