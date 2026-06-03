@@ -5,6 +5,8 @@ export default function App() {
   const [notes, setNotes] = useState([])
   const [loading, setLoading] = useState(true)
   const debounceTimers = useRef({})
+  // IDs de notas que el usuario está editando activamente — ignoramos Realtime UPDATE para ellas
+  const editingIds = useRef(new Set())
 
   // Carga inicial
   useEffect(() => {
@@ -26,8 +28,14 @@ export default function App() {
         { event: '*', schema: 'public', table: 'notes' },
         (payload) => {
           if (payload.eventType === 'INSERT') {
-            setNotes((prev) => [...prev, payload.new])
+            setNotes((prev) => {
+              // Evitar duplicados
+              if (prev.some((n) => n.id === payload.new.id)) return prev
+              return [...prev, payload.new]
+            })
           } else if (payload.eventType === 'UPDATE') {
+            // Si el usuario está editando esta nota, no sobreescribir su texto
+            if (editingIds.current.has(payload.new.id)) return
             setNotes((prev) =>
               prev.map((n) => (n.id === payload.new.id ? payload.new : n))
             )
@@ -41,38 +49,33 @@ export default function App() {
     return () => supabase.removeChannel(channel)
   }, [])
 
-  // Agregar nota nueva — optimista: aparece local de inmediato
+  // Agregar nota — solo Realtime la inserta en el estado, sin optimismo
   async function addNote() {
-    const { data, error } = await supabase
-      .from('notes')
-      .insert({ content: '' })
-      .select()
-      .single()
-    if (error) {
-      console.error('Error al insertar:', error)
-      return
-    }
-    // Si Realtime no la trae sola, la agregamos manualmente
-    setNotes((prev) => {
-      const yaExiste = prev.some((n) => n.id === data.id)
-      return yaExiste ? prev : [...prev, data]
-    })
+    const { error } = await supabase.from('notes').insert({ content: '' })
+    if (error) console.error('Error al insertar:', error)
   }
 
-  // Editar con debounce: actualiza local inmediato, guarda en Supabase al dejar de escribir
+  // Editar con debounce
   function handleChange(id, value) {
+    // Marcar como "editando" para que Realtime no sobreescriba
+    editingIds.current.add(id)
+
     setNotes((prev) =>
       prev.map((n) => (n.id === id ? { ...n, content: value } : n))
     )
+
     clearTimeout(debounceTimers.current[id])
     debounceTimers.current[id] = setTimeout(async () => {
       await supabase.from('notes').update({ content: value }).eq('id', id)
+      // Ya guardado, permitir updates de Realtime nuevamente
+      editingIds.current.delete(id)
     }, 800)
   }
 
   // Borrar nota
   async function deleteNote(id) {
     clearTimeout(debounceTimers.current[id])
+    editingIds.current.delete(id)
     await supabase.from('notes').delete().eq('id', id)
   }
 
@@ -81,7 +84,6 @@ export default function App() {
     try {
       await navigator.clipboard.writeText(content)
     } catch {
-      // fallback para navegadores sin permiso
       const el = document.createElement('textarea')
       el.value = content
       document.body.appendChild(el)
