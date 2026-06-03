@@ -38,11 +38,9 @@ function NoteCard({ note, onDelete, onCopy, onChange, isNew, isDeleting, isCopie
         isDeleting ? 'note-exit' : '',
       ].join(' ').trim()}
     >
-      {/* Handle de arrastre */}
       <div className="drag-handle" {...attributes} {...listeners} title="Arrastrar">
         ⠿
       </div>
-
       <textarea
         value={note.content}
         onChange={(e) => onChange(note.id, e.target.value)}
@@ -78,13 +76,14 @@ export default function App() {
   const [newIds, setNewIds] = useState(new Set())
   const debounceTimers = useRef({})
   const editingIds = useRef(new Set())
+  // Flag para ignorar updates de Realtime mientras arrastramos
+  const isDraggingRef = useRef(false)
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
     useSensor(TouchSensor, { activationConstraint: { delay: 150, tolerance: 5 } })
   )
 
-  // Carga inicial
   useEffect(() => {
     async function fetchNotes() {
       const { data } = await supabase
@@ -96,7 +95,6 @@ export default function App() {
     }
     fetchNotes()
 
-    // Realtime
     const channel = supabase
       .channel('notes-realtime')
       .on(
@@ -106,8 +104,8 @@ export default function App() {
           if (payload.eventType === 'INSERT') {
             setNotes((prev) => {
               if (prev.some((n) => n.id === payload.new.id)) return prev
-              // Nueva nota al principio
-              return [payload.new, ...prev]
+              const next = [payload.new, ...prev]
+              return next.sort((a, b) => (a.position ?? 0) - (b.position ?? 0))
             })
             setNewIds((prev) => new Set(prev).add(payload.new.id))
             setTimeout(() => {
@@ -118,10 +116,23 @@ export default function App() {
               })
             }, 500)
           } else if (payload.eventType === 'UPDATE') {
-            if (editingIds.current.has(payload.new.id)) return
-            setNotes((prev) =>
-              prev.map((n) => (n.id === payload.new.id ? { ...n, content: payload.new.content } : n))
-            )
+            setNotes((prev) => {
+              const updated = prev.map((n) =>
+                n.id === payload.new.id
+                  ? {
+                      ...n,
+                      // Solo actualizar content si no lo está editando el usuario local
+                      content: editingIds.current.has(n.id) ? n.content : payload.new.content,
+                      position: payload.new.position,
+                    }
+                  : n
+              )
+              // Si cambió position de alguna nota y no estamos arrastrando, reordenar
+              if (!isDraggingRef.current) {
+                return updated.sort((a, b) => (a.position ?? 0) - (b.position ?? 0))
+              }
+              return updated
+            })
           } else if (payload.eventType === 'DELETE') {
             setNotes((prev) => prev.filter((n) => n.id !== payload.old.id))
           }
@@ -132,7 +143,6 @@ export default function App() {
     return () => supabase.removeChannel(channel)
   }, [])
 
-  // Agregar nota arriba con position menor al mínimo actual
   async function addNote() {
     const minPos = notes.length > 0 ? Math.min(...notes.map((n) => n.position ?? 0)) : 0
     const { error } = await supabase
@@ -141,7 +151,6 @@ export default function App() {
     if (error) console.error('Error al insertar:', error)
   }
 
-  // Editar con debounce
   function handleChange(id, value) {
     editingIds.current.add(id)
     setNotes((prev) =>
@@ -154,7 +163,6 @@ export default function App() {
     }, 800)
   }
 
-  // Borrar
   async function deleteNote(id) {
     clearTimeout(debounceTimers.current[id])
     editingIds.current.delete(id)
@@ -165,7 +173,6 @@ export default function App() {
     }, 350)
   }
 
-  // Copiar
   async function copyNote(id, content) {
     try {
       await navigator.clipboard.writeText(content)
@@ -181,8 +188,12 @@ export default function App() {
     setTimeout(() => setCopiedId(null), 1200)
   }
 
-  // Drag end — reordenar local y persistir en Supabase
+  function handleDragStart() {
+    isDraggingRef.current = true
+  }
+
   async function handleDragEnd(event) {
+    isDraggingRef.current = false
     const { active, over } = event
     if (!over || active.id === over.id) return
 
@@ -190,13 +201,14 @@ export default function App() {
       const oldIndex = prev.findIndex((n) => n.id === active.id)
       const newIndex = prev.findIndex((n) => n.id === over.id)
       const reordered = arrayMove(prev, oldIndex, newIndex)
+      const withPositions = reordered.map((note, i) => ({ ...note, position: i * 1000 }))
 
-      // Guardar nuevas posiciones en Supabase (sin await, fire & forget)
-      reordered.forEach((note, i) => {
-        supabase.from('notes').update({ position: i * 1000 }).eq('id', note.id)
+      // Persistir cada posición en Supabase — Realtime lo propagará a todos
+      withPositions.forEach((note) => {
+        supabase.from('notes').update({ position: note.position }).eq('id', note.id)
       })
 
-      return reordered.map((note, i) => ({ ...note, position: i * 1000 }))
+      return withPositions
     })
   }
 
@@ -216,6 +228,7 @@ export default function App() {
       <DndContext
         sensors={sensors}
         collisionDetection={closestCenter}
+        onDragStart={handleDragStart}
         onDragEnd={handleDragEnd}
       >
         <SortableContext
