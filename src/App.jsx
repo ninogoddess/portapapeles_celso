@@ -1,6 +1,75 @@
 import React, { useEffect, useRef, useState } from 'react'
+import {
+  DndContext,
+  closestCenter,
+  PointerSensor,
+  TouchSensor,
+  useSensor,
+  useSensors,
+} from '@dnd-kit/core'
+import {
+  SortableContext,
+  verticalListSortingStrategy,
+  useSortable,
+  arrayMove,
+} from '@dnd-kit/sortable'
+import { CSS } from '@dnd-kit/utilities'
 import { supabase } from './supabase'
 
+// ── Nota individual sortable ──────────────────────────────────────────────────
+function NoteCard({ note, onDelete, onCopy, onChange, isNew, isDeleting, isCopied }) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
+    useSortable({ id: note.id })
+
+  const style = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    opacity: isDragging ? 0.5 : 1,
+    zIndex: isDragging ? 999 : 'auto',
+  }
+
+  return (
+    <div
+      ref={setNodeRef}
+      style={style}
+      className={[
+        'note',
+        isNew ? 'note-enter' : '',
+        isDeleting ? 'note-exit' : '',
+      ].join(' ').trim()}
+    >
+      {/* Handle de arrastre */}
+      <div className="drag-handle" {...attributes} {...listeners} title="Arrastrar">
+        ⠿
+      </div>
+
+      <textarea
+        value={note.content}
+        onChange={(e) => onChange(note.id, e.target.value)}
+        placeholder="Escribe algo..."
+        rows={4}
+      />
+      <div className="note-actions">
+        <button
+          className="btn-copy"
+          onClick={() => onCopy(note.id, note.content)}
+          title="Copiar"
+        >
+          {isCopied ? <span className="tick">✓ Copiado</span> : '📄 Copiar'}
+        </button>
+        <button
+          className="btn-delete"
+          onClick={() => onDelete(note.id)}
+          title="Borrar"
+        >
+          🗑 Borrar
+        </button>
+      </div>
+    </div>
+  )
+}
+
+// ── App principal ─────────────────────────────────────────────────────────────
 export default function App() {
   const [notes, setNotes] = useState([])
   const [loading, setLoading] = useState(true)
@@ -10,17 +79,24 @@ export default function App() {
   const debounceTimers = useRef({})
   const editingIds = useRef(new Set())
 
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
+    useSensor(TouchSensor, { activationConstraint: { delay: 150, tolerance: 5 } })
+  )
+
+  // Carga inicial
   useEffect(() => {
     async function fetchNotes() {
       const { data } = await supabase
         .from('notes')
         .select('*')
-        .order('created_at', { ascending: true })
+        .order('position', { ascending: true })
       setNotes(data || [])
       setLoading(false)
     }
     fetchNotes()
 
+    // Realtime
     const channel = supabase
       .channel('notes-realtime')
       .on(
@@ -30,9 +106,9 @@ export default function App() {
           if (payload.eventType === 'INSERT') {
             setNotes((prev) => {
               if (prev.some((n) => n.id === payload.new.id)) return prev
-              return [...prev, payload.new]
+              // Nueva nota al principio
+              return [payload.new, ...prev]
             })
-            // Marcar como nueva para animación de entrada
             setNewIds((prev) => new Set(prev).add(payload.new.id))
             setTimeout(() => {
               setNewIds((prev) => {
@@ -44,7 +120,7 @@ export default function App() {
           } else if (payload.eventType === 'UPDATE') {
             if (editingIds.current.has(payload.new.id)) return
             setNotes((prev) =>
-              prev.map((n) => (n.id === payload.new.id ? payload.new : n))
+              prev.map((n) => (n.id === payload.new.id ? { ...n, content: payload.new.content } : n))
             )
           } else if (payload.eventType === 'DELETE') {
             setNotes((prev) => prev.filter((n) => n.id !== payload.old.id))
@@ -56,11 +132,16 @@ export default function App() {
     return () => supabase.removeChannel(channel)
   }, [])
 
+  // Agregar nota arriba con position menor al mínimo actual
   async function addNote() {
-    const { error } = await supabase.from('notes').insert({ content: '' })
+    const minPos = notes.length > 0 ? Math.min(...notes.map((n) => n.position ?? 0)) : 0
+    const { error } = await supabase
+      .from('notes')
+      .insert({ content: '', position: minPos - 1000 })
     if (error) console.error('Error al insertar:', error)
   }
 
+  // Editar con debounce
   function handleChange(id, value) {
     editingIds.current.add(id)
     setNotes((prev) =>
@@ -73,10 +154,10 @@ export default function App() {
     }, 800)
   }
 
+  // Borrar
   async function deleteNote(id) {
     clearTimeout(debounceTimers.current[id])
     editingIds.current.delete(id)
-    // Animar salida, luego borrar
     setDeletingId(id)
     setTimeout(async () => {
       await supabase.from('notes').delete().eq('id', id)
@@ -84,6 +165,7 @@ export default function App() {
     }, 350)
   }
 
+  // Copiar
   async function copyNote(id, content) {
     try {
       await navigator.clipboard.writeText(content)
@@ -99,6 +181,25 @@ export default function App() {
     setTimeout(() => setCopiedId(null), 1200)
   }
 
+  // Drag end — reordenar local y persistir en Supabase
+  async function handleDragEnd(event) {
+    const { active, over } = event
+    if (!over || active.id === over.id) return
+
+    setNotes((prev) => {
+      const oldIndex = prev.findIndex((n) => n.id === active.id)
+      const newIndex = prev.findIndex((n) => n.id === over.id)
+      const reordered = arrayMove(prev, oldIndex, newIndex)
+
+      // Guardar nuevas posiciones en Supabase (sin await, fire & forget)
+      reordered.forEach((note, i) => {
+        supabase.from('notes').update({ position: i * 1000 }).eq('id', note.id)
+      })
+
+      return reordered.map((note, i) => ({ ...note, position: i * 1000 }))
+    })
+  }
+
   if (loading) return <div className="center">Cargando...</div>
 
   return (
@@ -112,45 +213,31 @@ export default function App() {
         <p className="empty">No hay notas aún. Agrega una.</p>
       )}
 
-      <div className="notes">
-        {notes.map((note) => (
-          <div
-            className={[
-              'note',
-              newIds.has(note.id) ? 'note-enter' : '',
-              deletingId === note.id ? 'note-exit' : '',
-            ].join(' ').trim()}
-            key={note.id}
-          >
-            <textarea
-              value={note.content}
-              onChange={(e) => handleChange(note.id, e.target.value)}
-              placeholder="Escribe algo..."
-              rows={4}
-            />
-            <div className="note-actions">
-              <button
-                className="btn-copy"
-                onClick={() => copyNote(note.id, note.content)}
-                title="Copiar"
-              >
-                {copiedId === note.id ? (
-                  <span className="tick">✓ Copiado</span>
-                ) : (
-                  '📄 Copiar'
-                )}
-              </button>
-              <button
-                className="btn-delete"
-                onClick={() => deleteNote(note.id)}
-                title="Borrar"
-              >
-                🗑 Borrar
-              </button>
-            </div>
+      <DndContext
+        sensors={sensors}
+        collisionDetection={closestCenter}
+        onDragEnd={handleDragEnd}
+      >
+        <SortableContext
+          items={notes.map((n) => n.id)}
+          strategy={verticalListSortingStrategy}
+        >
+          <div className="notes">
+            {notes.map((note) => (
+              <NoteCard
+                key={note.id}
+                note={note}
+                isNew={newIds.has(note.id)}
+                isDeleting={deletingId === note.id}
+                isCopied={copiedId === note.id}
+                onChange={handleChange}
+                onDelete={deleteNote}
+                onCopy={copyNote}
+              />
+            ))}
           </div>
-        ))}
-      </div>
+        </SortableContext>
+      </DndContext>
     </div>
   )
 }
