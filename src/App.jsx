@@ -121,15 +121,14 @@ export default function App() {
                 n.id === payload.new.id
                   ? {
                       ...n,
-                      // Solo actualizar content si no lo está editando el usuario local
                       content: editingIds.current.has(n.id) ? n.content : payload.new.content,
                       position: payload.new.position,
                     }
                   : n
               )
-              // Si cambió position de alguna nota y no estamos arrastrando, reordenar
+              // Reordenar siempre que no estemos arrastrando nosotros mismos
               if (!isDraggingRef.current) {
-                return updated.sort((a, b) => (a.position ?? 0) - (b.position ?? 0))
+                return [...updated].sort((a, b) => (a.position ?? 0) - (b.position ?? 0))
               }
               return updated
             })
@@ -197,19 +196,21 @@ export default function App() {
     const { active, over } = event
     if (!over || active.id === over.id) return
 
-    setNotes((prev) => {
-      const oldIndex = prev.findIndex((n) => n.id === active.id)
-      const newIndex = prev.findIndex((n) => n.id === over.id)
-      const reordered = arrayMove(prev, oldIndex, newIndex)
-      const withPositions = reordered.map((note, i) => ({ ...note, position: i * 1000 }))
+    // Calcular nuevo orden fuera del setState para poder hacer await
+    const oldIndex = notes.findIndex((n) => n.id === active.id)
+    const newIndex = notes.findIndex((n) => n.id === over.id)
+    const reordered = arrayMove(notes, oldIndex, newIndex)
+    const withPositions = reordered.map((note, i) => ({ ...note, position: i * 1000 }))
 
-      // Persistir cada posición en Supabase — Realtime lo propagará a todos
-      withPositions.forEach((note) => {
+    // Actualizar local inmediatamente
+    setNotes(withPositions)
+
+    // Persistir en Supabase en paralelo — Realtime propagará a todos
+    await Promise.all(
+      withPositions.map((note) =>
         supabase.from('notes').update({ position: note.position }).eq('id', note.id)
-      })
-
-      return withPositions
-    })
+      )
+    )
   }
 
   if (loading) return <div className="center">Cargando...</div>
